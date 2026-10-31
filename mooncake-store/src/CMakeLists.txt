@@ -1,5 +1,14 @@
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
+# Optional SDK adapter; the generic Client path has no KVClient dependency.
+option(STORE_USE_KVCLIENT "Build the keyed external-store SDK adapter" OFF)
+set(KVCLIENT_INCLUDE_DIR
+    ""
+    CACHE PATH "Directory containing kv_client.h")
+set(KVCLIENT_LIBRARY
+    ""
+    CACHE FILEPATH "Path to libkv_client.so")
+
 add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
 
@@ -95,6 +104,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
+    storage/external_store_backend_factory.cpp
     common/client_buffer_allocation.cpp
     mmap_arena.cpp
     config/hugepage_config.cpp
@@ -513,10 +523,19 @@ if(STORE_USE_K8S_LEASE)
 endif()
 
 # Sources used only by Store clients and the complete mooncake_store library.
+if(STORE_USE_KVCLIENT)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES storage/kvclient_backend.cpp)
+endif()
 add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
 set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(STORE_USE_KVCLIENT)
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE STORE_USE_KVCLIENT)
+  target_include_directories(mooncake_store_client_objects
+                             PRIVATE ${KVCLIENT_INCLUDE_DIR})
+endif()
 target_include_directories(
   mooncake_store_client_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
                                         ${CMAKE_CURRENT_SOURCE_DIR})
@@ -615,6 +634,10 @@ add_library(
   $<TARGET_OBJECTS:mooncake_store_master_objects>
   $<TARGET_OBJECTS:mooncake_store_client_objects>)
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
+if(STORE_USE_KVCLIENT)
+  target_include_directories(mooncake_store PUBLIC ${KVCLIENT_INCLUDE_DIR})
+  target_link_libraries(mooncake_store PRIVATE ${KVCLIENT_LIBRARY})
+endif()
 target_link_libraries(
   mooncake_store
   PUBLIC mooncake_local_ssd

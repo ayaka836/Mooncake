@@ -37,7 +37,9 @@ class DummyClient : public PyClient {
                    const std::string &ssd_offload_path = "",
                    const std::string &tenant_id = "default",
                    bool enable_client_http_server = false,
-                   int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+                   int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+                   const std::string &external_store_backend = "",
+                   const ConfigDict &external_store_options = {}) {
         // Dummy client does not support real setup
         return -1;
     };

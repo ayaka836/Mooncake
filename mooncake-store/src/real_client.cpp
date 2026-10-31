@@ -53,6 +53,8 @@
 #include "shm_helper.h"
 #include "memory_location.h"
 #include "version.h"
+#include "storage/external_store_backend.h"
+#include "storage/external_store_backend_factory.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -914,7 +916,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port,
+    const std::string &external_store_backend,
+    const ConfigDict &external_store_options) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
 #ifdef USE_ASCEND_DIRECT
@@ -1011,6 +1015,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "Failed to create client after "
                        << auto_port_config.max_retries << " retries";
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    // Initialize the external backend before registering target memory.
+    if (!external_store_backend.empty()) {
+        auto external_backend =
+            CreateExternalStoreBackend(external_store_backend);
+        if (!external_backend) {
+            client_.reset();
+            return tl::unexpected(external_backend.error());
+        }
+        auto installed = client_->SetExternalStoreBackend(
+            *external_backend, external_store_options);
+        if (!installed) {
+            client_.reset();
+            return tl::unexpected(installed.error());
         }
     }
 
@@ -1330,12 +1350,15 @@ int RealClient::setup_real(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port,
+    const std::string &external_store_backend,
+    const ConfigDict &external_store_options) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id, enable_client_http_server, client_http_port));
+        tenant_id, enable_client_http_server, client_http_port,
+        external_store_backend, external_store_options));
 }
 
 namespace {
@@ -1478,11 +1501,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
+    // Extract backend options from the flat ConfigDict.
+    const auto external_store_backend =
+        get_config(config, "external_store_backend");
+    ConfigDict external_store_options;
+    const std::string option_prefix = "external_store_options.";
+    for (const auto &[key, value] : config) {
+        if (key.starts_with(option_prefix)) {
+            external_store_options.emplace(key.substr(option_prefix.size()),
+                                           value);
+        }
+    }
+
     return setup_internal(local_hostname, metadata_server, global_segment_size,
                           local_buffer_size, protocol, rdma_devices,
                           master_server_addr, nullptr, ipc_socket_path, 50052,
                           enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+                          enable_client_http_server, client_http_port,
+                          external_store_backend, external_store_options);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -4427,7 +4463,26 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, bool size_is_buffer_capacity, bool verify_checksum) {
-    auto metadata_result = resolve_ranged_read_metadata(key);
+    std::optional<tl::expected<QueryResult, ErrorCode>> query;
+    if (client_ && client_->external_store_backend_)
+        query.emplace(client_->Query(key));
+    if (query && client_->ShouldUseExternal(*query)) {
+        const std::vector<std::vector<Slice>> targets{
+            {{static_cast<char *>(buffer) + dst_offset, size}}};
+        std::vector<size_t> actual_sizes;
+        auto submitted =
+            size_is_buffer_capacity
+                ? client_->LoadExternalAsync({key}, targets, &actual_sizes)
+                : client_->LoadExternalRangesAsync(
+                      {key}, targets, {{src_offset}}, &actual_sizes);
+        if (!submitted) return tl::unexpected(submitted.error());
+        auto loaded = client_->WaitExternal(*submitted);
+        if (!loaded.front()) return tl::unexpected(loaded.front().error());
+        return static_cast<int64_t>(actual_sizes.front());
+    }
+    auto metadata_result = query ? build_ranged_read_metadata_from_query_result(
+                                       key, std::move(*query))
+                                 : resolve_ranged_read_metadata(key);
     if (!metadata_result) {
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
              metadata_result.error() == ErrorCode::REPLICA_IS_NOT_READY) &&
@@ -5913,9 +5968,21 @@ RealClient::batch_get_into_internal(
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
+    std::vector<ObjectKey> external_keys;
+    std::vector<std::vector<Slice>> external_targets;
+    std::vector<size_t> external_indices;
+
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
+
+        // Try the external backend when Master has no readable replica.
+        if (client_->ShouldUseExternal(query_results[i])) {
+            external_keys.push_back(key);
+            external_targets.push_back({Slice{buffers[i], sizes[i]}});
+            external_indices.push_back(i);
+            continue;
+        }
 
         // Handle query failures
         if (!query_results[i]) {
@@ -6022,9 +6089,18 @@ RealClient::batch_get_into_internal(
         results[i] = static_cast<int64_t>(total_size);
     }
 
+    // Submit external reads before running the existing load sequence.
+    std::vector<size_t> actual_sizes;
+    tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+        external_submission;
+    if (!external_keys.empty()) {
+        external_submission = client_->LoadExternalAsync(
+            external_keys, external_targets, &actual_sizes);
+    }
+
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_operations.empty() &&
-        disk_operations.empty()) {
+        disk_operations.empty() && external_keys.empty()) {
         return results;
     }
 
@@ -6238,6 +6314,21 @@ RealClient::batch_get_into_internal(
     //           << "us, with memory key count: " << valid_operations.size()
     //           << ", offload key count: " << offload_object_count;
 
+    // Collect external reads after the existing loads have completed.
+    if (!external_keys.empty()) {
+        auto loaded = external_submission
+                          ? client_->WaitExternal(*external_submission)
+                          : std::vector<tl::expected<void, ErrorCode>>(
+                                external_keys.size(),
+                                tl::unexpected(external_submission.error()));
+        for (size_t i = 0; i < external_indices.size(); ++i) {
+            results[external_indices[i]] =
+                loaded[i] ? tl::expected<int64_t, ErrorCode>(
+                                static_cast<int64_t>(actual_sizes[i]))
+                          : tl::expected<int64_t, ErrorCode>(
+                                tl::unexpected(loaded[i].error()));
+        }
+    }
     return results;
 }
 
@@ -6379,8 +6470,18 @@ std::vector<int> RealClient::batch_get_session_start(
     }
     auto local_endpoints = client_->GetLocalEndpoints();
 
+    std::vector<ObjectKey> external_keys;
+    std::vector<size_t> external_indices;
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
+        if (client_->external_store_backend_)
+            external_get_sessions_.erase(keys[i]);
+        if (client_->ShouldUseExternal(query_results[i])) {
+            get_sessions_.erase(keys[i]);
+            external_keys.push_back(keys[i]);
+            external_indices.push_back(i);
+            continue;
+        }
         if (!query_results[i]) {
             results[i] = static_cast<int>(toInt(query_results[i].error()));
             get_sessions_.erase(keys[i]);
@@ -6407,6 +6508,24 @@ std::vector<int> RealClient::batch_get_session_start(
         get_sessions_.emplace(keys[i],
                               FilterQueryResult(query_result, *replica));
         results[i] = 0;
+    }
+    if (!external_keys.empty()) {
+        std::vector<uint8_t> exists;
+        auto submitted = client_->QueryExternalAsync(external_keys, &exists);
+        auto statuses = submitted ? client_->WaitExternal(*submitted)
+                                  : std::vector<tl::expected<void, ErrorCode>>(
+                                        external_keys.size(),
+                                        tl::unexpected(submitted.error()));
+        for (size_t i = 0; i < external_keys.size(); ++i) {
+            if (statuses[i] && exists[i]) {
+                external_get_sessions_.insert(external_keys[i]);
+                results[external_indices[i]] = 0;
+            } else {
+                results[external_indices[i]] = static_cast<int>(
+                    toInt(statuses[i] ? ErrorCode::OBJECT_NOT_FOUND
+                                      : statuses[i].error()));
+            }
+        }
     }
     return results;
 }
@@ -6984,6 +7103,48 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         return results;
     }
 
+    std::vector<ObjectKey> external_keys;
+    std::vector<std::vector<Slice>> external_targets;
+    std::vector<std::vector<size_t>> external_offsets;
+    std::vector<size_t> external_indices;
+    if (client_->external_store_backend_) {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (!external_get_sessions_.contains(keys[i])) continue;
+            if (all_buffers[i].size() != all_sizes[i].size() ||
+                all_buffers[i].size() != all_src_offsets[i].size()) {
+                continue;
+            }
+            size_t bytes = 0;
+            bool valid = true;
+            for (const auto size : all_sizes[i]) {
+                if (size >
+                    static_cast<size_t>(std::numeric_limits<int>::max()) -
+                        bytes) {
+                    valid = false;
+                    break;
+                }
+                bytes += size;
+            }
+            if (!valid) continue;
+            if (bytes == 0) {
+                results[i] = 0;
+                continue;
+            }
+            external_keys.push_back(keys[i]);
+            external_targets.push_back(
+                SlicesFromBuffers(all_buffers[i], all_sizes[i]));
+            external_offsets.push_back(all_src_offsets[i]);
+            external_indices.push_back(i);
+        }
+    }
+    std::vector<size_t> actual_sizes;
+    tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode> submitted;
+    if (!external_keys.empty()) {
+        submitted = client_->LoadExternalRangesAsync(
+            external_keys, external_targets, external_offsets, &actual_sizes);
+    }
+
     auto requests = prepare_session_range_read_requests(
         keys, all_buffers, all_sizes, all_src_offsets, results);
     auto read_plan =
@@ -6994,6 +7155,17 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     execute_session_local_disk_range_reads(read_plan.local_disk_requests,
                                            results);
     execute_session_disk_range_reads(read_plan.disk_requests, results);
+    if (!external_keys.empty()) {
+        auto loaded = submitted ? client_->WaitExternal(*submitted)
+                                : std::vector<tl::expected<void, ErrorCode>>(
+                                      external_keys.size(),
+                                      tl::unexpected(submitted.error()));
+        for (size_t i = 0; i < external_indices.size(); ++i) {
+            results[external_indices[i]] =
+                loaded[i] ? static_cast<int>(actual_sizes[i])
+                          : static_cast<int>(toInt(loaded[i].error()));
+        }
+    }
     return results;
 }
 
@@ -7001,6 +7173,7 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (const auto &key : keys) {
         get_sessions_.erase(key);
+        external_get_sessions_.erase(key);
     }
     return 0;
 }
@@ -7545,9 +7718,24 @@ RealClient::batch_get_into_multi_buffers_internal(
     std::unordered_map<std::string, DiskKeyInfo> valid_local_disk_ops;
     std::vector<DuplicateDiskOp> duplicate_disk_ops;
     valid_operations.reserve(num_keys);
+    std::vector<ObjectKey> external_keys;
+    std::vector<std::vector<Slice>> external_targets;
+    std::vector<size_t> external_indices;
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
+        if (client_->ShouldUseExternal(query_results[i])) {
+            if (all_buffers[i].size() != all_sizes[i].size()) {
+                results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+            external_keys.push_back(key);
+            external_targets.push_back(
+                SlicesFromBuffers(all_buffers[i], all_sizes[i]));
+            external_indices.push_back(i);
+            results.emplace_back(int64_t{0});
+            continue;
+        }
         // Handle query failures
         if (!query_results[i]) {
             const auto error = query_results[i].error();
@@ -7642,8 +7830,17 @@ RealClient::batch_get_into_multi_buffers_internal(
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
     }
+    // Submit external reads before running the existing load sequence.
+    std::vector<size_t> actual_sizes;
+    tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+        external_submission;
+    if (!external_keys.empty()) {
+        external_submission = client_->LoadExternalAsync(
+            external_keys, external_targets, &actual_sizes);
+    }
     // Early return if no valid operations
-    if (valid_operations.empty() && valid_local_disk_ops.empty()) {
+    if (valid_operations.empty() && valid_local_disk_ops.empty() &&
+        external_keys.empty()) {
         return results;
     }
 
@@ -7924,6 +8121,21 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    // Collect external reads after the existing loads have completed.
+    if (!external_keys.empty()) {
+        auto loaded = external_submission
+                          ? client_->WaitExternal(*external_submission)
+                          : std::vector<tl::expected<void, ErrorCode>>(
+                                external_keys.size(),
+                                tl::unexpected(external_submission.error()));
+        for (size_t i = 0; i < external_indices.size(); ++i) {
+            results[external_indices[i]] =
+                loaded[i] ? tl::expected<int64_t, ErrorCode>(
+                                static_cast<int64_t>(actual_sizes[i]))
+                          : tl::expected<int64_t, ErrorCode>(
+                                tl::unexpected(loaded[i].error()));
+        }
+    }
     return results;
 }
 

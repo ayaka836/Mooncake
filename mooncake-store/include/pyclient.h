@@ -306,7 +306,9 @@ class PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT) = 0;
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        const std::string &external_store_backend = "",
+        const ConfigDict &external_store_options = {}) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
