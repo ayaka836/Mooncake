@@ -51,6 +51,7 @@
 #include "environ.h"
 #include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/external_store_backend.h"
 
 namespace mooncake {
 
@@ -551,6 +552,14 @@ Client::~Client() {
     hot_cache_handler_.reset();
     UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
+
+    if (external_store_backend_) {
+        auto result = external_store_backend_->Shutdown();
+        if (!result) {
+            LOG(ERROR) << "Failed to shut down external store backend: "
+                       << toString(result.error());
+        }
+    }
 }
 
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
@@ -1145,9 +1154,71 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     return client;
 }
 
+tl::expected<void, ErrorCode> Client::SetExternalStoreBackend(
+    std::shared_ptr<ExternalStoreBackend> backend,
+    const std::unordered_map<std::string, std::string>& options) {
+    if (external_store_backend_ || !backend) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto initialized = backend->Init(options);
+    if (!initialized) return tl::unexpected(initialized.error());
+    external_store_backend_ = std::move(backend);
+    return {};
+}
+
+bool Client::ShouldUseExternal(
+    const tl::expected<QueryResult, ErrorCode>& query) const {
+    if (!external_store_backend_) return false;
+    const bool readable =
+        query &&
+        std::any_of(query->replicas.begin(), query->replicas.end(),
+                    [](const auto& replica) {
+                        return replica.status == ReplicaStatus::COMPLETE;
+                    });
+    return !readable;
+}
+
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+Client::LoadExternalAsync(const std::vector<ObjectKey>& keys,
+                          const std::vector<std::vector<Slice>>& targets,
+                          std::vector<size_t>* actual_sizes) {
+    return external_store_backend_->GetBatchAsync(
+        keys, targets, TenantId(master_client_.tenant_id()), actual_sizes);
+}
+
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+Client::QueryExternalAsync(const std::vector<ObjectKey>& keys,
+                           std::vector<uint8_t>* exists) {
+    return external_store_backend_->BatchExistsAsync(
+        keys, TenantId(master_client_.tenant_id()), exists);
+}
+
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+Client::LoadExternalRangesAsync(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& targets,
+    const std::vector<std::vector<size_t>>& source_offsets,
+    std::vector<size_t>* actual_sizes) {
+    return external_store_backend_->GetRangesAsync(
+        keys, targets, source_offsets, TenantId(master_client_.tenant_id()),
+        actual_sizes);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::WaitExternal(
+    ExternalStoreBackend::TaskHandle task) {
+    return external_store_backend_->Wait(task);
+}
+
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           std::vector<Slice>& slices) {
     auto query_result = Query(object_key);
+    if (ShouldUseExternal(query_result)) {
+        std::vector<size_t> actual_sizes;
+        auto submitted =
+            LoadExternalAsync({object_key}, {slices}, &actual_sizes);
+        if (!submitted) return tl::unexpected(submitted.error());
+        return WaitExternal(*submitted).front();
+    }
     if (!query_result) {
         return tl::unexpected(query_result.error());
     }
@@ -1168,7 +1239,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<size_t> valid_indices;
     std::vector<std::string> valid_keys;
 
+    std::vector<ObjectKey> external_keys;
+    std::vector<std::vector<Slice>> external_targets;
+    std::vector<size_t> external_indices;
+
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
+        if (ShouldUseExternal(batched_query_results[i])) {
+            auto target = slices.find(object_keys[i]);
+            if (target == slices.end()) {
+                results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+            external_keys.push_back(object_keys[i]);
+            external_targets.push_back(target->second);
+            external_indices.push_back(i);
+            results.emplace_back();
+            continue;
+        }
         if (batched_query_results[i]) {
             valid_query_results.emplace_back(batched_query_results[i].value());
             valid_indices.emplace_back(i);
@@ -1178,6 +1265,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results.emplace_back(
                 tl::unexpected(batched_query_results[i].error()));
         }
+    }
+
+    // Submit external reads before running the existing synchronous batch.
+    std::vector<size_t> actual_sizes;
+    tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+        external_submission;
+    if (!external_keys.empty()) {
+        external_submission =
+            LoadExternalAsync(external_keys, external_targets, &actual_sizes);
     }
 
     // If we have any valid queries, process them
@@ -1199,6 +1295,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
     }
 
+    if (!external_keys.empty()) {
+        auto loaded = external_submission
+                          ? WaitExternal(*external_submission)
+                          : std::vector<tl::expected<void, ErrorCode>>(
+                                external_keys.size(),
+                                tl::unexpected(external_submission.error()));
+        for (size_t i = 0; i < external_indices.size(); ++i) {
+            results[external_indices[i]] = loaded[i];
+        }
+    }
     return results;
 }
 
@@ -4026,67 +4132,150 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // Register supported targets with both TE and the external backend.
+    if (external_store_backend_) {
+        device::PointerInfo pointer_info{.kind = device::MemoryKind::kHost,
+                                         .device_id = -1};
+        auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+        runtime.FindDeviceForPointer(addr, &pointer_info);
+        if (external_store_backend_->SupportsMemory(pointer_info)) {
+            auto registered = external_store_backend_->RegisterMemory(
+                addr, length, location, pointer_info);
+            if (!registered) {
+                // Roll back TE registration if the external registration fails.
+                auto rollback = transfer_engine_->unregisterLocalMemory(
+                    addr, update_metadata);
+                if (rollback != 0) {
+                    LOG(ERROR)
+                        << "TE registration rollback failed: " << rollback;
+                }
+                return tl::unexpected(registered.error());
+            }
+        }
+    }
     return {};
 }
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
-        0) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    tl::expected<void, ErrorCode> result;
+    if (external_store_backend_) {
+        auto unregistered = external_store_backend_->UnregisterMemory(addr);
+        if (!unregistered) {
+            result = tl::unexpected(unregistered.error());
+        }
     }
-    return {};
+    auto te_result =
+        transfer_engine_->unregisterLocalMemory(addr, update_metadata);
+    if (te_result != 0) {
+        if (external_store_backend_) {
+            LOG(ERROR) << "TE memory unregistration failed: " << te_result;
+        }
+        if (result) result = tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return result;
 }
 
+namespace {
+
+tl::expected<bool, ErrorCode> MergeExistence(
+    const tl::expected<bool, ErrorCode>& master, bool external_hit) {
+    // An external hit overrides the original Master result.
+    if (external_hit) return true;
+    return master;
+}
+
+}  // namespace
+
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
+    std::vector<uint8_t> exists;
+    tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode> submitted;
+    if (external_store_backend_) {
+        submitted = QueryExternalAsync({key}, &exists);
+    }
     auto result = master_client_.ExistKey(key);
-    return result;
+    if (!external_store_backend_ || !submitted) return result;
+    auto statuses = WaitExternal(*submitted);
+    return MergeExistence(result, statuses.front() && exists.front());
 }
 
 tl::expected<bool, ErrorCode> Client::ProbeKey(const std::string& key) {
+    std::vector<uint8_t> exists;
+    tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode> submitted;
+    if (external_store_backend_) {
+        submitted = QueryExternalAsync({key}, &exists);
+    }
     auto result = master_client_.ProbeKey(key);
-    return result;
+    if (!external_store_backend_ || !submitted) return result;
+    auto statuses = WaitExternal(*submitted);
+    return MergeExistence(result, statuses.front() && exists.front());
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchExistKey(keys);
+    auto query_master = [&] {
+        auto response = master_client_.BatchExistKey(keys);
 
-    // Check if we got the expected number of responses
-    if (response.size() != keys.size()) {
-        LOG(ERROR) << "BatchExistKey response size mismatch. Expected: "
-                   << keys.size() << ", Got: " << response.size();
-        // Return vector of RPC_FAIL errors
-        std::vector<tl::expected<bool, ErrorCode>> results;
-        results.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        // Check if we got the expected number of responses
+        if (response.size() != keys.size()) {
+            LOG(ERROR) << "BatchExistKey response size mismatch. Expected: "
+                       << keys.size() << ", Got: " << response.size();
+            // Return vector of RPC_FAIL errors
+            std::vector<tl::expected<bool, ErrorCode>> results;
+            results.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+            }
+            return results;
         }
-        return results;
-    }
 
-    // Return the response directly as it's already in the correct
-    // format
+        // Return the response directly as it's already in the correct
+        // format
+        return response;
+    };
+    if (!external_store_backend_) return query_master();
+    if (keys.empty()) return {};
+
+    std::vector<uint8_t> exists;
+    auto submitted = QueryExternalAsync(keys, &exists);
+    auto response = query_master();
+    if (!submitted) return response;
+    auto statuses = WaitExternal(*submitted);
+    for (size_t i = 0; i < keys.size(); ++i)
+        response[i] = MergeExistence(response[i], statuses[i] && exists[i]);
     return response;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchProbeKey(
     const std::vector<std::string>& keys) {
-    auto response = master_client_.BatchProbeKey(keys);
+    auto query_master = [&] {
+        auto response = master_client_.BatchProbeKey(keys);
 
-    // Check if we got the expected number of responses
-    if (response.size() != keys.size()) {
-        LOG(ERROR) << "BatchProbeKey response size mismatch. Expected: "
-                   << keys.size() << ", Got: " << response.size();
-        // Return vector of RPC_FAIL errors
-        std::vector<tl::expected<bool, ErrorCode>> results;
-        results.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        // Check if we got the expected number of responses
+        if (response.size() != keys.size()) {
+            LOG(ERROR) << "BatchProbeKey response size mismatch. Expected: "
+                       << keys.size() << ", Got: " << response.size();
+            // Return vector of RPC_FAIL errors
+            std::vector<tl::expected<bool, ErrorCode>> results;
+            results.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+            }
+            return results;
         }
-        return results;
-    }
 
+        return response;
+    };
+    if (!external_store_backend_) return query_master();
+    if (keys.empty()) return {};
+
+    std::vector<uint8_t> exists;
+    auto submitted = QueryExternalAsync(keys, &exists);
+    auto response = query_master();
+    if (!submitted) return response;
+    auto statuses = WaitExternal(*submitted);
+    for (size_t i = 0; i < keys.size(); ++i)
+        response[i] = MergeExistence(response[i], statuses[i] && exists[i]);
     return response;
 }
 
