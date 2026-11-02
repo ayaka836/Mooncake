@@ -98,7 +98,9 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        const std::string &external_store_backend = "",
+        const ConfigDict &external_store_options = {});
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -108,7 +110,9 @@ class RealClient : public PyClient {
     };
 
     int initAll(const std::string &protocol, const std::string &device_name,
-                size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
+                size_t mount_segment_size = 1024 * 1024 * 16,  // Default 16MB
+                const std::string &external_store_backend = "",
+                const ConfigDict &external_store_options = {});
 
     uint64_t alloc_from_mem_pool(size_t size) { return 0; };
 
@@ -630,14 +634,18 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        const std::string &external_store_backend = "",
+        const ConfigDict &external_store_options = {});
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
-        size_t mount_segment_size = 1024 * 1024 * 16);
+        size_t mount_segment_size = 1024 * 1024 * 16,
+        const std::string &external_store_backend = "",
+        const ConfigDict &external_store_options = {});
 
     tl::expected<void, ErrorCode> unregister_buffer_internal(void *buffer);
 
@@ -660,6 +668,10 @@ class RealClient : public PyClient {
     build_ranged_read_metadata_from_query_result(
         const std::string &key,
         tl::expected<QueryResult, ErrorCode> query_result);
+
+    tl::expected<QueryResult, ErrorCode> resolve_ranged_read_query(
+        const std::string &key, const QueryResultCache *query_result_cache,
+        bool allow_query_refresh);
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key,
@@ -1085,6 +1097,8 @@ class RealClient : public PyClient {
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
+    // External sessions retain a source choice without a Master replica lease.
+    std::unordered_set<ObjectKey> external_get_sessions_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
 
     void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
