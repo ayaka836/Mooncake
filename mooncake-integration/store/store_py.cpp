@@ -2407,7 +2407,9 @@ PYBIND11_MODULE(store, m) {
                const std::string &ssd_offload_path = "",
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
-               int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+               int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+               const std::string &external_store_backend = "",
+               const ConfigDict &external_store_options = {}) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2423,7 +2425,8 @@ PYBIND11_MODULE(store, m) {
                         local_buffer_size, protocol, rdma_devices,
                         master_server_addr, transfer_engine, "",
                         enable_ssd_offload, ssd_offload_path, tenant_id,
-                        enable_client_http_server, client_http_port);
+                        enable_client_http_server, client_http_port,
+                        external_store_backend, external_store_options);
                 }
                 return ret;
             },
@@ -2434,7 +2437,9 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_ssd_offload") = false,
             py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
             py::arg("enable_client_http_server") = false,
-            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
+            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
+            py::arg("external_store_backend") = "",
+            py::arg("external_store_options") = ConfigDict{})
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2444,6 +2449,32 @@ PYBIND11_MODULE(store, m) {
                 ConfigDict config;
                 for (auto item : config_dict) {
                     std::string key = py::str(item.first);
+                    // Flatten backend options into ConfigDict.
+                    if (key == "external_store_options" &&
+                        py::isinstance<py::dict>(item.second)) {
+                        std::function<void(const py::dict &,
+                                           const std::string &)>
+                            flatten_options;
+                        flatten_options = [&](const py::dict &options,
+                                              const std::string &prefix) {
+                            for (auto option : options) {
+                                const auto name =
+                                    prefix + "." +
+                                    std::string(py::str(option.first));
+                                if (py::isinstance<py::dict>(option.second)) {
+                                    flatten_options(
+                                        py::reinterpret_borrow<py::dict>(
+                                            option.second),
+                                        name);
+                                } else {
+                                    config[name] = py::str(option.second);
+                                }
+                            }
+                        };
+                        flatten_options(
+                            py::reinterpret_borrow<py::dict>(item.second), key);
+                        continue;
+                    }
                     std::string value = py::str(item.second);
                     config[key] = value;
                 }
@@ -2474,7 +2505,10 @@ PYBIND11_MODULE(store, m) {
             "  tenant_id: Tenant identifier (default 'default').\n"
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
-            "  client_http_port: Client HTTP metrics port (default 9300).")
+            "  client_http_port: Client HTTP metrics port (default 9300).\n"
+            "  external_store_backend: External backend type; empty disables "
+            "it.\n"
+            "  external_store_options: Backend initialization options dict.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
@@ -2492,13 +2526,22 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
             py::arg("server_address"))
-        .def("init_all",
-             [](MooncakeStorePyWrapper &self, const std::string &protocol,
-                const std::string &device_name,
-                size_t mount_segment_size = 1024 * 1024 * 16) {
-                 return self.store_->initAll(protocol, device_name,
-                                             mount_segment_size);
-             })
+        .def(
+            "init_all",
+            [](MooncakeStorePyWrapper &self, const std::string &protocol,
+               const std::string &device_name,
+               size_t mount_segment_size = 1024 * 1024 * 16,
+               const std::string &external_store_backend = "",
+               const ConfigDict &external_store_options = {}) {
+                if (!self.store_) self.init_real_client();
+                return self.store_->initAll(
+                    protocol, device_name, mount_segment_size,
+                    external_store_backend, external_store_options);
+            },
+            py::arg("protocol"), py::arg("device_name"),
+            py::arg("mount_segment_size") = 1024 * 1024 * 16,
+            py::arg("external_store_backend") = "",
+            py::arg("external_store_options") = ConfigDict{})
         .def("mount_segment", &MooncakeStorePyWrapper::mount_segment,
              py::arg("path"), py::arg("size"), py::arg("offset") = 0,
              py::arg("protocol") = "tcp", py::arg("location") = "")
