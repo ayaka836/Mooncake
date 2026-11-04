@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -84,7 +85,7 @@ class ExternalStoreBackend {
     /**
      * @brief Waits for completion and consumes the task handle. All task access
      * to memory and registrations ends before return, including on timeout.
-     * @param task Handle from an accepted submission; invalid after this call.
+     * @param task Handle consumed on entry, including if Wait throws.
      * @param output Operation results, valid only for successful items. Fields
      * not used by the operation are empty. Must remain valid during this call.
      * @return One completion status per input key, in input order. Operation
@@ -109,6 +110,44 @@ class ExternalStoreBackend {
      * @return Success or an unregistration ErrorCode.
      */
     virtual tl::expected<void, ErrorCode> UnregisterMemory(void* addr) = 0;
+};
+
+/**
+ * @brief Owns an accepted backend task and waits on destruction if still
+ * pending.
+ */
+class ExternalStoreTaskGuard {
+   public:
+    ExternalStoreTaskGuard() = default;
+
+    /**
+     * @brief Takes ownership of an accepted task without owning its backend.
+     * @param backend Backend that stays usable until the task is consumed.
+     * @param task Handle consumed by Wait or destruction.
+     */
+    ExternalStoreTaskGuard(ExternalStoreBackend* backend,
+                           ExternalStoreBackend::TaskHandle task);
+    ~ExternalStoreTaskGuard();
+
+    ExternalStoreTaskGuard(const ExternalStoreTaskGuard&) = delete;
+    ExternalStoreTaskGuard& operator=(const ExternalStoreTaskGuard&) = delete;
+    ExternalStoreTaskGuard(ExternalStoreTaskGuard&& other) noexcept;
+    ExternalStoreTaskGuard& operator=(ExternalStoreTaskGuard&& other);
+
+    explicit operator bool() const { return task_.has_value(); }
+
+    /**
+     * @brief Waits for completion and consumes the task.
+     * @param output Operation results supplied to the backend Wait.
+     * @return Backend statuses, or empty statuses and output for an empty or
+     * moved-from guard. Such guards perform no backend work.
+     */
+    std::vector<tl::expected<void, ErrorCode>> Wait(
+        ExternalStoreBackend::TaskOutput& output);
+
+   private:
+    ExternalStoreBackend* backend_ = nullptr;
+    std::optional<ExternalStoreBackend::TaskHandle> task_;
 };
 
 }  // namespace mooncake

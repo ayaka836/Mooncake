@@ -113,12 +113,14 @@ set(MOONCAKE_STORE_MASTER_SOURCES
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
     storage/external/external_store_backend_factory.cpp
+    storage/external/external_store_task.cpp
     common/client_buffer_allocation.cpp
     mmap_arena.cpp
     config/hugepage_config.cpp
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    client_external_store.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp

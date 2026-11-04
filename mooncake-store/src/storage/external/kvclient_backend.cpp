@@ -1,13 +1,9 @@
 #include "storage/external/kvclient_backend.h"
 
-#include <algorithm>
-#include <cstring>
-#include <functional>
 #include <glog/logging.h>
 #include <iterator>
 #include <limits>
 #include <mutex>
-#include <xxhash.h>
 #include <utility>
 
 #include "device/accelerator_registry.h"
@@ -49,18 +45,6 @@ ErrorCode ToError(const kv::Status& status) {
 }
 
 }  // namespace
-
-tl::expected<kv::CacheKey, ErrorCode> KvClientBackend::EncodeKey(
-    const ObjectKey& key) {
-    const auto scoped_key = tenant_id_.MakeScopedKey(key);
-    const uint64_t hash = XXH64(scoped_key.data(), scoped_key.size(), 0);
-    XXH64_canonical_t canonical;
-    XXH64_canonicalFromHash(&canonical, hash);
-    kv::CacheKey encoded;
-    static_assert(kv::kCacheKeySizeBytes == sizeof(canonical.digest));
-    std::memcpy(encoded.data(), canonical.digest, encoded.size());
-    return encoded;
-}
 
 KvClientBackend::~KvClientBackend() { (void)Shutdown(); }
 
@@ -106,7 +90,7 @@ tl::expected<void, ErrorCode> KvClientBackend::Init(
                    << ", error=" << status.message;
         return tl::unexpected(ToError(status));
     }
-    tenant_id_ = tenant_id;
+    io_options_.kvns = tenant_id.value();
     return {};
 }
 
@@ -191,58 +175,45 @@ kv::TaskResult KvClientBackend::WaitForCompletion(kv::TaskId task) {
 
 tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
 KvClientBackend::BatchExistsAsync(const std::vector<ObjectKey>& keys) {
-    std::vector<kv::CacheKey> encoded_keys;
-    std::vector<size_t> indices;
-    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
-    encoded_keys.reserve(keys.size());
-    indices.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = EncodeKey(keys[i]);
-        if (!key) {
-            LOG(WARNING) << "Invalid KVClient query key, index=" << i
-                         << ", key=" << keys[i]
-                         << ", error=" << static_cast<int>(key.error());
-            results[i] = tl::unexpected(key.error());
-            continue;
-        }
-        encoded_keys.push_back(*key);
-        indices.push_back(i);
+    std::vector<kv::CacheKey> query_keys;
+    query_keys.reserve(keys.size());
+    for (const auto& key : keys) {
+        query_keys.push_back(kv::CacheKey::FromString(key));
     }
     kv::TaskId task = kv::kInvalidTaskId;
-    if (!encoded_keys.empty()) {
-        auto submitted = kv_client_->QueryAsync(encoded_keys, task);
+    if (!query_keys.empty()) {
+        auto submitted = kv_client_->QueryAsync(query_keys, task, io_options_);
         if (!submitted.ok()) {
             LOG(WARNING) << "Failed to submit KVClient query, keys="
-                         << encoded_keys.size()
+                         << query_keys.size()
                          << ", status=" << static_cast<int>(submitted.code)
                          << ", error=" << submitted.message;
             return tl::unexpected(ToError(submitted));
         }
     }
-    return new Completion([this, task, indices = std::move(indices),
-                           results =
-                               std::move(results)](TaskOutput& output) mutable {
-        kv::TaskResult completed;
-        if (task != kv::kInvalidTaskId) completed = WaitForCompletion(task);
-        output.exists.assign(results.size(), 0);
-        // Only OK and PARTIAL_FAILED guarantee valid per-entry results.
-        const bool has_entries =
-            completed.status.ok() ||
-            completed.status.code == kv::StatusCode::PARTIAL_FAILED;
-        for (size_t j = 0; j < indices.size(); ++j) {
-            const auto index = indices[j];
-            const auto& status =
-                has_entries ? completed.entryStatus[j] : completed.status;
-            const auto error = ToError(status);
-            if (error == ErrorCode::OK) {
-                output.exists[index] =
-                    status.code == kv::StatusCode::ENTRY_KEY_EXIST;
-            } else if (error != ErrorCode::OBJECT_NOT_FOUND) {
-                results[index] = tl::unexpected(error);
+    return new Completion(
+        [this, task, count = keys.size()](TaskOutput& output) {
+            kv::TaskResult completed;
+            if (task != kv::kInvalidTaskId) completed = WaitForCompletion(task);
+            std::vector<tl::expected<void, ErrorCode>> results(count);
+            output.exists.assign(count, 0);
+            // Only OK and PARTIAL_FAILED guarantee valid per-entry results.
+            const bool has_entries =
+                completed.status.ok() ||
+                completed.status.code == kv::StatusCode::PARTIAL_FAILED;
+            for (size_t i = 0; i < count; ++i) {
+                const auto& status =
+                    has_entries ? completed.entryStatus[i] : completed.status;
+                const auto error = ToError(status);
+                if (error == ErrorCode::OK) {
+                    output.exists[i] =
+                        status.code == kv::StatusCode::ENTRY_KEY_EXIST;
+                } else if (error != ErrorCode::OBJECT_NOT_FOUND) {
+                    results[i] = tl::unexpected(error);
+                }
             }
-        }
-        return std::move(results);
-    });
+            return results;
+        });
 }
 
 tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
@@ -280,14 +251,6 @@ KvClientBackend::SubmitLoads(
     // Keep registrations stable until the SDK accepts the descriptors.
     std::shared_lock lock(memory_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = EncodeKey(keys[i]);
-        if (!key) {
-            LOG(WARNING) << "Invalid KVClient load key, index=" << i
-                         << ", key=" << keys[i]
-                         << ", error=" << static_cast<int>(key.error());
-            results[i] = tl::unexpected(key.error());
-            continue;
-        }
         std::vector<kv::KVBuffer> object_entries;
         if (targets[i].empty()) {
             LOG(WARNING) << "Missing KVClient load targets for key=" << keys[i];
@@ -329,26 +292,28 @@ KvClientBackend::SubmitLoads(
                 break;
             }
             kv::KVBuffer entry{};
-            entry.key = *key;
+            entry.key = kv::CacheKey::FromString(keys[i]);
             entry.buffer.region = (*registered)->region;
             entry.buffer.handle = (*registered)->handle;
             entry.buffer.region.addr = addr;
             entry.buffer.region.size = slice.size;
             // Offset is relative to the object, not the registered region.
             entry.offset = static_cast<uint32_t>(object_offset);
-            object_entries.push_back(entry);
+            object_entries.push_back(std::move(entry));
         }
         // Submit an input key only when all its slices are valid.
         if (!results[i]) continue;
-        for (const auto& entry : object_entries) {
-            entries.push_back(entry);
+        for (auto& entry : object_entries) {
             indices.push_back(i);
             lengths.push_back(entry.buffer.region.size);
+            entries.push_back(std::move(entry));
         }
     }
     kv::TaskId sdk_task = kv::kInvalidTaskId;
     auto submitted = kv::Status::OK();
-    if (!entries.empty()) submitted = kv_client_->LoadAsync(entries, sdk_task);
+    if (!entries.empty()) {
+        submitted = kv_client_->LoadAsync(entries, sdk_task, io_options_);
+    }
     lock.unlock();
     if (!submitted.ok()) {
         LOG(WARNING) << "Failed to submit KVClient load, entries="
