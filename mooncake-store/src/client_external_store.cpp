@@ -133,4 +133,58 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchExistsExternal(
     return results;
 }
 
+tl::expected<ExternalStoreTaskGuard, ErrorCode> Client::PutExternalAsync(
+    const ObjectKey& key, const std::vector<Slice>& slices) {
+    if (!external_store_backend_) return ExternalStoreTaskGuard{};
+    auto submitted = external_store_backend_->PutAsync(
+        key, slices, TenantId(master_client_.tenant_id()));
+    if (!submitted) return tl::unexpected(submitted.error());
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
+}
+
+tl::expected<ExternalStoreTaskGuard, ErrorCode> Client::BatchPutExternalAsync(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& slices) {
+    if (!external_store_backend_ || keys.empty())
+        return ExternalStoreTaskGuard{};
+    auto submitted = external_store_backend_->BatchPutAsync(
+        keys, slices, TenantId(master_client_.tenant_id()));
+    if (!submitted) return tl::unexpected(submitted.error());
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
+}
+
+tl::expected<void, ErrorCode> Client::FinishExternalPut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    tl::expected<void, ErrorCode> native_result) {
+    FinishExternalPut(submission, std::span(&native_result, 1));
+    return native_result;
+}
+
+// A key succeeds if either storage path succeeds; always wait for submitted
+// work.
+void Client::FinishExternalPut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    std::span<tl::expected<void, ErrorCode>> native_results) {
+    if (!submission) {
+        LOG(WARNING) << "External store submission failed: "
+                     << submission.error();
+        return;
+    }
+    if (!*submission) return;
+    auto external = submission->Wait();
+    if (external.size() != native_results.size()) {
+        LOG(ERROR) << "External store result count mismatch: expected="
+                   << native_results.size() << ", actual=" << external.size();
+        return;
+    }
+    for (size_t i = 0; i < external.size(); ++i) {
+        if (!external[i]) {
+            LOG(WARNING) << "External store operation failed at index=" << i
+                         << ": " << external[i].error();
+        } else {
+            native_results[i] = {};
+        }
+    }
+}
+
 }  // namespace mooncake

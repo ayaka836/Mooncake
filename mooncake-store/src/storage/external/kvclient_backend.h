@@ -20,6 +20,14 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> Init(
         const std::unordered_map<std::string, std::string>& options) override;
     tl::expected<void, ErrorCode> Shutdown() override;
+    tl::expected<TaskHandle, ErrorCode> PutAsync(
+        const ObjectKey& key, const std::vector<Slice>& slices,
+        const TenantId& tenant_id) override;
+    tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const TenantId& tenant_id) override;
+
     tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id,
         std::vector<uint8_t>* exists) override;
@@ -41,6 +49,17 @@ class KvClientBackend final : public ExternalStoreBackend {
    private:
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;
+    tl::expected<void, ErrorCode> AppendStoreEntries(
+        const kv::CacheKey& key, const std::vector<Slice>& slices,
+        std::vector<kv::KVBuffer>& entries);
+    std::vector<kv::KVBuffer> BuildStoreEntries(
+        const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        std::vector<size_t>& indices,
+        std::vector<tl::expected<void, ErrorCode>>& results);
+    std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(
+        kv::TaskId task, const std::vector<size_t>& indices,
+        std::vector<tl::expected<void, ErrorCode>> results);
     tl::expected<kv::CacheKey, ErrorCode> EncodeKey(const ObjectKey& key,
                                                     const TenantId& tenant_id);
     kv::TaskResult WaitForCompletion(kv::TaskId task);

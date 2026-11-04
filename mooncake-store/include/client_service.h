@@ -1060,6 +1060,17 @@ class Client {
 
    private:
     tl::expected<void, ErrorCode> InitExternalStoreBackendFromEnvironment();
+    tl::expected<void, ErrorCode> FinishExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        tl::expected<void, ErrorCode> native_result = {});
+    void FinishExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        std::span<tl::expected<void, ErrorCode>> native_results);
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> PutExternalAsync(
+        const ObjectKey& key, const std::vector<Slice>& slices);
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& slices);
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchExistsExternalAsync(
         const std::vector<ObjectKey>& keys, std::vector<uint8_t>* exists);
     /**

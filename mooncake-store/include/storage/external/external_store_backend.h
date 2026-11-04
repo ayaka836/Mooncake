@@ -41,6 +41,29 @@ class ExternalStoreBackend {
     virtual tl::expected<void, ErrorCode> Shutdown() = 0;
 
     /**
+     * @brief Submits an object write. Source data stays unchanged until Wait.
+     * @param key Object key to write.
+     * @param slices Source regions describing the object in input order.
+     * @param tenant_id Tenant for the operation.
+     * @return Accepted task handle or a submission ErrorCode.
+     */
+    virtual tl::expected<TaskHandle, ErrorCode> PutAsync(
+        const ObjectKey& key, const std::vector<Slice>& slices,
+        const TenantId& tenant_id) = 0;
+
+    /**
+     * @brief Submits object writes. Source data stays unchanged until Wait.
+     * @param keys Object keys to write.
+     * @param batched_slices Source slices per key, in object-byte order.
+     * @param tenant_id Tenant for the operation.
+     * @return Accepted task handle or a submission ErrorCode.
+     */
+    virtual tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const TenantId& tenant_id) = 0;
+
+    /**
      * @brief Submits object existence queries.
      * @param keys Object keys to query.
      * @param tenant_id Tenant for the operation.

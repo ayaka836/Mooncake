@@ -398,4 +398,126 @@ KvClientBackend::FindRegisteredMemory(const Slice& slice) const {
     return &registered;
 }
 
+tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
+    const kv::CacheKey& key, const std::vector<Slice>& slices,
+    std::vector<kv::KVBuffer>& entries) {
+    if (slices.empty()) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    // Preserve slice order even when the source addresses are noncontiguous.
+    uint64_t logical_offset = 0;
+    for (const auto& slice : slices) {
+        auto region = FindRegisteredMemory(slice);
+        if (!region) return tl::unexpected(region.error());
+        const auto& registered = **region;
+        const auto addr = reinterpret_cast<uintptr_t>(slice.ptr);
+        uint64_t consumed = 0;
+        while (consumed < slice.size) {
+            if (logical_offset > std::numeric_limits<uint32_t>::max())
+                return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+            // Split descriptors, never pad or copy source payload.
+            const uint64_t length =
+                std::min(slice.size - consumed, uint64_t{0x00fffe00});
+            kv::KVBuffer entry{};
+            entry.key = key;
+            entry.buffer.region = registered.region;
+            entry.buffer.region.addr = addr + consumed;
+            entry.buffer.region.size = length;
+            entry.buffer.handle = registered.handle;
+            entry.offset = static_cast<uint32_t>(logical_offset);
+            entries.push_back(entry);
+            consumed += length;
+            logical_offset += length;
+        }
+    }
+    return {};
+}
+
+std::vector<kv::KVBuffer> KvClientBackend::BuildStoreEntries(
+    const TenantId& tenant_id, const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& batched_slices,
+    std::vector<size_t>& indices,
+    std::vector<tl::expected<void, ErrorCode>>& results) {
+    // The caller holds a shared memory lock while resolving registrations.
+    std::vector<kv::KVBuffer> entries;
+    results.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto key = EncodeKey(keys[i], tenant_id);
+        if (!key) {
+            results[i] = tl::unexpected(key.error());
+            continue;
+        }
+        const auto begin = entries.size();
+        results[i] = AppendStoreEntries(*key, batched_slices[i], entries);
+        if (!results[i]) {
+            // Do not submit a partial set of descriptors for this input key.
+            entries.resize(begin);
+            continue;
+        }
+        indices.insert(indices.end(), entries.size() - begin, i);
+    }
+    return entries;
+}
+
+std::vector<tl::expected<void, ErrorCode>> KvClientBackend::WaitForKeyResults(
+    kv::TaskId task, const std::vector<size_t>& indices,
+    std::vector<tl::expected<void, ErrorCode>> results) {
+    const auto completed = WaitForCompletion(task);
+    const auto& status = completed.status;
+    const bool has_entries =
+        (status.ok() || status.code == kv::StatusCode::PARTIAL_FAILED) &&
+        completed.entryStatus.size() == indices.size();
+    // Multiple SDK entries can belong to one input key; any failure wins.
+    for (size_t j = 0; j < indices.size(); ++j) {
+        const auto error =
+            ToError(has_entries ? completed.entryStatus[j] : status);
+        auto& item = results[indices[j]];
+        if (item && error != ErrorCode::OK) item = tl::unexpected(error);
+    }
+    return results;
+}
+
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+KvClientBackend::PutAsync(const ObjectKey& key,
+                          const std::vector<Slice>& slices,
+                          const TenantId& tenant_id) {
+    std::shared_lock memory_lock(memory_mutex_);
+    std::vector<size_t> indices;
+    std::vector<tl::expected<void, ErrorCode>> results;
+    auto entries =
+        BuildStoreEntries(tenant_id, {key}, {slices}, indices, results);
+    if (!results.front()) return tl::unexpected(results.front().error());
+    kv::TaskId task;
+    auto submitted = kv_client_->StoreAsync(entries, task);
+    memory_lock.unlock();
+    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
+    return SaveTask([this, task, indices = std::move(indices),
+                     results = std::move(results)]() mutable {
+        return WaitForKeyResults(task, indices, std::move(results));
+    });
+}
+
+tl::expected<ExternalStoreBackend::TaskHandle, ErrorCode>
+KvClientBackend::BatchPutAsync(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& batched_slices,
+    const TenantId& tenant_id) {
+    if (keys.size() != batched_slices.size())
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    std::shared_lock memory_lock(memory_mutex_);
+    std::vector<size_t> indices;
+    std::vector<tl::expected<void, ErrorCode>> results;
+    auto entries =
+        BuildStoreEntries(tenant_id, keys, batched_slices, indices, results);
+    kv::TaskId task = kv::kInvalidTaskId;
+    auto submitted = kv::Status::OK();
+    if (!entries.empty())
+        submitted = kv_client_->BatchStoreAsync(entries, task);
+    memory_lock.unlock();
+    if (!submitted.ok()) return tl::unexpected(ToError(submitted));
+    return SaveTask([this, task, indices = std::move(indices),
+                     results = std::move(results)]() mutable {
+        if (task == kv::kInvalidTaskId) return std::move(results);
+        return WaitForKeyResults(task, indices, std::move(results));
+    });
+}
+
 }  // namespace mooncake

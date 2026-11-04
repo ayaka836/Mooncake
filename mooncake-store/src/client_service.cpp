@@ -2082,12 +2082,14 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    auto external_submission = PutExternalAsync(key, slices);
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
-            return tl::unexpected(checksum_result.error());
+            return FinishExternalPut(external_submission,
+                                     tl::unexpected(checksum_result.error()));
         }
         object_checksum = *checksum_result;
     }
@@ -2119,7 +2121,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
-            return {};
+            return FinishExternalPut(external_submission);
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
@@ -2128,7 +2130,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
         }
-        return tl::unexpected(err);
+        return FinishExternalPut(external_submission, tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2218,7 +2220,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
-            return tl::unexpected(err);
+            return FinishExternalPut(external_submission, tl::unexpected(err));
         }
     }
 
@@ -2227,15 +2229,17 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
-            return tl::unexpected(revoke_result.error());
+            return FinishExternalPut(external_submission,
+                                     tl::unexpected(revoke_result.error()));
         }
     }
 
     if (!finalize_decision.success) {
-        return tl::unexpected(finalize_decision.error);
+        return FinishExternalPut(external_submission,
+                                 tl::unexpected(finalize_decision.error));
     }
 
-    return {};
+    return FinishExternalPut(external_submission);
 }
 
 namespace {
@@ -3690,11 +3694,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager,
     bool group_by_target) {
-    if (!config.ValidSessionIds(keys.size()) ||
+    if (keys.size() != batched_slices.size() ||
+        !config.ValidSessionIds(keys.size()) ||
         !config.HasValidKeyHints(keys.size())) {
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    auto external_submission = BatchPutExternalAsync(keys, batched_slices);
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3703,8 +3709,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
-            return std::vector<tl::expected<void, ErrorCode>>(
+            auto native_results = std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
+            FinishExternalPut(external_submission, std::span(native_results));
+            return native_results;
         }
     }
     StartBatchPut(ops, client_cfg);
@@ -3723,7 +3731,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    auto native_results = CollectResults(ops);
+    FinishExternalPut(external_submission, std::span(native_results));
+    return native_results;
 }
 
 // Defined after PutOperation: std::vector<PutOperation> must be instantiated
