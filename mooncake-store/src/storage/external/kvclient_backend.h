@@ -1,0 +1,55 @@
+#pragma once
+
+#include <functional>
+#include <map>
+#include <memory>
+#include <shared_mutex>
+#include <utility>
+
+#include "kv_client.h"
+#include "storage/external/external_store_backend.h"
+
+namespace mooncake {
+
+// ExternalStoreBackend implementation backed by the KVClient SDK.
+class KvClientBackend final : public ExternalStoreBackend {
+   public:
+    ~KvClientBackend() override;
+    tl::expected<void, ErrorCode> Init(
+        const std::unordered_map<std::string, std::string>& options,
+        const TenantId& tenant_id) override;
+    tl::expected<void, ErrorCode> Shutdown() override;
+    tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
+        const std::vector<ObjectKey>& keys) override;
+    tl::expected<TaskHandle, ErrorCode> BatchGetAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets) override;
+    tl::expected<TaskHandle, ErrorCode> BatchGetRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets,
+        const std::vector<std::vector<size_t>>& source_offsets) override;
+
+    std::vector<tl::expected<void, ErrorCode>> Wait(
+        TaskHandle task, TaskOutput& output) override;
+    tl::expected<void, ErrorCode> RegisterMemory(
+        void* addr, size_t length, const std::string& location) override;
+    tl::expected<void, ErrorCode> UnregisterMemory(void* addr) override;
+
+   private:
+    tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
+        const Slice& slice) const;
+    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(const ObjectKey& key);
+    kv::TaskResult WaitForCompletion(kv::TaskId task);
+    tl::expected<TaskHandle, ErrorCode> SubmitLoads(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets,
+        const std::vector<std::vector<size_t>>& source_offsets);
+    using Completion =
+        std::function<std::vector<tl::expected<void, ErrorCode>>(TaskOutput&)>;
+    std::unique_ptr<kv::KvClient> kv_client_;
+    TenantId tenant_id_;
+    std::shared_mutex memory_mutex_;
+    std::map<uintptr_t, kv::RegisteredMemory> regions_;
+};
+
+}  // namespace mooncake
