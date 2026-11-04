@@ -6763,9 +6763,19 @@ RealClient::batch_get_into_internal(
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
+    ExternalReadRequests external_requests;
+
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
+
+        // Try the external backend when Master has no readable replica.
+        if (client_->ShouldGetFromExternalStore(query_results[i])) {
+            external_requests.keys.push_back(key);
+            external_requests.targets.push_back({Slice{buffers[i], sizes[i]}});
+            external_requests.result_indices.push_back(i);
+            continue;
+        }
 
         // Handle query failures
         if (!query_results[i]) {
@@ -6872,9 +6882,14 @@ RealClient::batch_get_into_internal(
         results[i] = static_cast<int64_t>(total_size);
     }
 
+    // Submit external reads before running the existing load sequence.
+    std::vector<size_t> external_sizes;
+    auto external_read = client_->BatchGetExternalAsync(
+        external_requests.keys, external_requests.targets, &external_sizes);
+
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_operations.empty() &&
-        disk_operations.empty()) {
+        disk_operations.empty() && external_requests.keys.empty()) {
         return results;
     }
 
@@ -7088,6 +7103,12 @@ RealClient::batch_get_into_internal(
     //           << "us, with memory key count: " << valid_operations.size()
     //           << ", offload key count: " << offload_object_count;
 
+    // Collect external reads after the existing loads have completed.
+    auto loaded = client_->WaitForExternalReads(external_read, external_sizes,
+                                                external_requests.keys.size());
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        results[external_requests.result_indices[i]] = std::move(loaded[i]);
+    }
     return results;
 }
 
@@ -7229,8 +7250,22 @@ std::vector<int> RealClient::batch_get_session_start(
     }
     auto local_endpoints = client_->GetLocalEndpoints();
 
+    const auto external_results =
+        check_external_get_candidates(keys, query_results);
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
+        if (auto external = external_results.find(i);
+            external != external_results.end()) {
+            get_sessions_.erase(keys[i]);
+            if (external->second) {
+                get_sessions_.emplace(keys[i], ExternalReadSource{});
+            }
+            results[i] =
+                external->second
+                    ? 0
+                    : static_cast<int>(toInt(external->second.error()));
+            continue;
+        }
         if (!query_results[i]) {
             results[i] = static_cast<int>(toInt(query_results[i].error()));
             get_sessions_.erase(keys[i]);
@@ -7313,7 +7348,7 @@ RealClient::prepare_session_range_read_requests(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const std::vector<std::vector<size_t>> &all_src_offsets,
-    std::vector<int> &results) {
+    std::vector<int> &results, ExternalReadRequests &external_requests) {
     std::vector<SessionRangeReadRequest> requests;
     requests.reserve(keys.size());
 
@@ -7331,21 +7366,30 @@ RealClient::prepare_session_range_read_requests(
 
         auto session = get_sessions_.find(keys[request_index]);
         if (session == get_sessions_.end()) continue;
-        if (session->second.IsLeaseExpired(validation_time)) {
+        const auto *query = std::get_if<QueryResult>(&session->second);
+        if (!query) {
+            auto prepared = append_external_range_read_request(
+                external_requests, keys[request_index],
+                SlicesFromBuffers(buffers, sizes), offsets, request_index);
+            results[request_index] =
+                prepared ? 0 : static_cast<int>(toInt(prepared.error()));
+            continue;
+        }
+        const auto &query_result = *query;
+        if (query_result.IsLeaseExpired(validation_time)) {
             get_sessions_.erase(session);
             results[request_index] =
                 static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             continue;
         }
-        if (session->second.replicas.empty() ||
-            (!StoreHcaAffinityEnabled() &&
-             session->second.replicas.size() != 1)) {
+        if (query_result.replicas.empty() ||
+            (!StoreHcaAffinityEnabled() && query_result.replicas.size() != 1)) {
             results[request_index] =
                 static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             continue;
         }
 
-        const auto &replica = session->second.replicas.front();
+        const auto &replica = query_result.replicas.front();
         const uint64_t replica_size = calculate_total_size(replica);
         if (replica_size > std::numeric_limits<size_t>::max()) {
             results[request_index] =
@@ -7384,11 +7428,11 @@ RealClient::prepare_session_range_read_requests(
         }
 
         requests.push_back(SessionRangeReadRequest{
-            keys[request_index], request_index, replica, session->second,
+            keys[request_index], request_index, replica, query_result,
             std::vector<void *>(buffers.begin(), buffers.end()),
             std::vector<size_t>(sizes.begin(), sizes.end()),
             std::vector<size_t>(offsets.begin(), offsets.end()),
-            transferred_bytes, session->second.lease_timeout});
+            transferred_bytes, query_result.lease_timeout});
     }
     return requests;
 }
@@ -7982,16 +8026,29 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         return results;
     }
 
+    ExternalReadRequests external_requests;
     auto requests = prepare_session_range_read_requests(
-        keys, all_buffers, all_sizes, all_src_offsets, results);
+        keys, all_buffers, all_sizes, all_src_offsets, results,
+        external_requests);
     auto read_plan =
         classify_session_range_read_requests(std::move(requests), results);
+    std::vector<size_t> external_sizes;
+    auto external_read = client_->BatchGetExternalRangesAsync(
+        external_requests.keys, external_requests.targets,
+        external_requests.source_offsets, &external_sizes);
 
     execute_session_memory_range_reads(read_plan.memory_requests, results);
     execute_session_dfs_range_reads(read_plan.dfs_requests, results);
     execute_session_local_disk_range_reads(read_plan.local_disk_requests,
                                            results);
     execute_session_disk_range_reads(read_plan.disk_requests, results);
+    auto loaded = client_->WaitForExternalReads(external_read, external_sizes,
+                                                external_requests.keys.size());
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        results[external_requests.result_indices[i]] =
+            loaded[i] ? static_cast<int>(*loaded[i])
+                      : static_cast<int>(toInt(loaded[i].error()));
+    }
     return results;
 }
 
@@ -8578,10 +8635,23 @@ RealClient::batch_get_into_multi_buffers_internal(
     std::unordered_map<std::string, DiskKeyInfo> valid_local_disk_ops;
     std::vector<DuplicateDiskOp> duplicate_disk_ops;
     valid_operations.reserve(num_keys);
+    ExternalReadRequests external_requests;
     auto local_endpoints = client_->GetLocalEndpoints();
     KickPrefetchForDiskHeadedKeys(keys, query_results, local_endpoints);
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
+        if (client_->ShouldGetFromExternalStore(query_results[i])) {
+            if (all_buffers[i].size() != all_sizes[i].size()) {
+                results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+            external_requests.keys.push_back(key);
+            external_requests.targets.push_back(
+                SlicesFromBuffers(all_buffers[i], all_sizes[i]));
+            external_requests.result_indices.push_back(i);
+            results.emplace_back(int64_t{0});
+            continue;
+        }
         // Handle query failures
         if (!query_results[i]) {
             const auto error = query_results[i].error();
@@ -8676,8 +8746,13 @@ RealClient::batch_get_into_multi_buffers_internal(
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
     }
+    // Submit external reads before running the existing load sequence.
+    std::vector<size_t> external_sizes;
+    auto external_read = client_->BatchGetExternalAsync(
+        external_requests.keys, external_requests.targets, &external_sizes);
     // Early return if no valid operations
-    if (valid_operations.empty() && valid_local_disk_ops.empty()) {
+    if (valid_operations.empty() && valid_local_disk_ops.empty() &&
+        external_requests.keys.empty()) {
         return results;
     }
 
@@ -8957,6 +9032,12 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    // Collect external reads after the existing loads have completed.
+    auto loaded = client_->WaitForExternalReads(external_read, external_sizes,
+                                                external_requests.keys.size());
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        results[external_requests.result_indices[i]] = std::move(loaded[i]);
+    }
     return results;
 }
 

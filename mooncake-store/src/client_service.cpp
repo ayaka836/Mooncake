@@ -577,6 +577,14 @@ Client::~Client() {
     hot_cache_handler_.reset();
     UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
+
+    if (external_store_backend_) {
+        auto result = external_store_backend_->Shutdown();
+        if (!result) {
+            LOG(ERROR) << "Failed to shut down external store backend: "
+                       << toString(result.error());
+        }
+    }
 }
 
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
@@ -1306,6 +1314,10 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     client->InitTransferSubmitter();
+
+    if (!client->InitExternalStoreBackendFromEnvironment()) {
+        return std::nullopt;
+    }
     // Initialize local hot cache
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {
@@ -4218,26 +4230,60 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // Register with both TE and the external backend.
+    if (external_store_backend_) {
+        auto registered =
+            external_store_backend_->RegisterMemory(addr, length, location);
+        if (!registered) {
+            // Roll back TE registration if the external registration fails.
+            auto rollback =
+                transfer_engine_->unregisterLocalMemory(addr, update_metadata);
+            if (rollback != 0) {
+                LOG(ERROR) << "TE registration rollback failed: " << rollback;
+            }
+            return tl::unexpected(registered.error());
+        }
+    }
     return {};
 }
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    const int rc =
+    tl::expected<void, ErrorCode> result;
+    if (external_store_backend_) {
+        auto unregistered = external_store_backend_->UnregisterMemory(addr);
+        if (!unregistered) {
+            result = tl::unexpected(unregistered.error());
+        }
+    }
+    auto te_result =
         transfer_engine_->unregisterLocalMemory(addr, update_metadata);
-    if (rc != 0) {
+    if (te_result != 0) {
+        if (external_store_backend_) {
+            LOG(ERROR) << "TE memory unregistration failed: " << te_result;
+        }
         // Distinguish "not registered" from real failures so callers can
         // tell an already-cleaned buffer apart from a live registration
         // whose deregistration failed.
-        return tl::unexpected(rc == ERR_ADDRESS_NOT_REGISTERED
-                                  ? ErrorCode::NOT_REGISTERED
-                                  : ErrorCode::INVALID_PARAMS);
+        if (result) {
+            result = tl::unexpected(te_result == ERR_ADDRESS_NOT_REGISTERED
+                                        ? ErrorCode::NOT_REGISTERED
+                                        : ErrorCode::INVALID_PARAMS);
+        }
     }
-    return {};
+    return result;
 }
 
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
+    std::vector<uint8_t> exists;
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> submitted;
+    if (external_store_backend_) {
+        submitted = BatchExistsExternalAsync({key}, &exists);
+    }
     auto result = master_client_.ExistKey(key);
+    if (!external_store_backend_ || !submitted) return result;
+    auto statuses = submitted->Wait();
+    if (statuses.front() && exists.front()) return true;
     return result;
 }
 
@@ -4248,23 +4294,27 @@ tl::expected<bool, ErrorCode> Client::ProbeKey(const std::string& key) {
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     const std::vector<std::string>& keys) {
+    if (external_store_backend_ && keys.empty()) return {};
+
+    std::vector<uint8_t> exists;
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> submitted;
+    if (external_store_backend_) {
+        submitted = BatchExistsExternalAsync(keys, &exists);
+    }
     auto response = master_client_.BatchExistKey(keys);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {
         LOG(ERROR) << "BatchExistKey response size mismatch. Expected: "
                    << keys.size() << ", Got: " << response.size();
-        // Return vector of RPC_FAIL errors
-        std::vector<tl::expected<bool, ErrorCode>> results;
-        results.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
-        }
-        return results;
+        response.assign(keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
     }
 
-    // Return the response directly as it's already in the correct
-    // format
+    if (!external_store_backend_ || !submitted) return response;
+    auto statuses = submitted->Wait();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (statuses[i] && exists[i]) response[i] = true;
+    }
     return response;
 }
 
