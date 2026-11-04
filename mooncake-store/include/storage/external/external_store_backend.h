@@ -84,7 +84,7 @@ class ExternalStoreBackend {
     /**
      * @brief Waits for completion and consumes the task handle. All task access
      * to memory and registrations ends before return, including on timeout.
-     * @param task Handle from an accepted submission; invalid after this call.
+     * @param task Handle consumed on entry, including if Wait throws.
      * @param output Operation results, valid only for successful items. Fields
      * not used by the operation are empty. Must remain valid during this call.
      * @return One completion status per input key, in input order. Operation

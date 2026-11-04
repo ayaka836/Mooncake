@@ -19,6 +19,8 @@
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
+#include "storage/external/external_store_backend.h"
+#include "storage/external/external_store_task.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -295,6 +297,52 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices,
         bool group_by_target = false);
 
+    /** @brief Returns whether this client has an external store backend. */
+    bool HasExternalStoreBackend() const {
+        return external_store_backend_ != nullptr;
+    }
+
+    /**
+     * @brief Checks whether a failed Master query can use external storage.
+     * @param query_error Error returned by the Master query.
+     * @return True when a backend is configured and the object is missing or
+     * its replicas are not ready.
+     */
+    bool ShouldGetFromExternalStore(ErrorCode query_error) const;
+
+    /**
+     * @brief Queries external object existence synchronously. No Master RPC.
+     * @param keys Object keys to query.
+     * @return One existence result or ErrorCode per key, in input order.
+     */
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistsExternal(
+        const std::vector<ObjectKey>& keys);
+
+    /**
+     * @brief Submits complete-object reads to the external backend. No Master
+     * RPC. The Client and target memory must remain valid until the task is
+     * consumed. Wait reports bytes read for successful keys in actual_sizes.
+     * @param keys Object keys to read.
+     * @param targets Destination slices per key; sizes are writable capacities.
+     * @return Task guard on acceptance, or ErrorCode if submission fails.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchGetExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets);
+
+    /**
+     * @brief Submits exact byte-range reads to the external backend. No Master
+     * RPC. Client and target lifetimes follow BatchGetExternalAsync.
+     * @param keys Object keys to read.
+     * @param targets Destination slices per key; sizes are exact read lengths.
+     * @param source_offsets Object-byte offsets matching each target slice.
+     * @return Task guard on acceptance, or ErrorCode if submission fails.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchGetExternalRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets,
+        const std::vector<std::vector<size_t>>& source_offsets);
+
     /**
      * @brief Stores data with replication
      * @param key Object key
@@ -526,10 +574,12 @@ class Client {
     /**
      * @brief Checks if an object exists
      * @param key Key to check
-     * @return ErrorCode::OK if exists, ErrorCode::OBJECT_NOT_FOUND if not
-     * exists, other ErrorCode for errors
+     * @param[out] external_only_hit Optional flag set when only the external
+     * store confirmed a hit.
+     * @return Whether the object exists, or an error if the query failed.
      */
-    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key,
+                                          bool* external_only_hit = nullptr);
 
     /**
      * @brief Point-in-time existence check that grants no read lease.
@@ -543,10 +593,13 @@ class Client {
     /**
      * @brief Checks if multiple objects exist
      * @param keys Vector of keys to check
+     * @param[out] external_only_indices Optional output listing the indices
+     * of hits confirmed only by the external store, in input order.
      * @return Vector of existence results for each key
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        std::vector<size_t>* external_only_indices = nullptr);
 
     WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
@@ -994,6 +1047,9 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    tl::expected<void, ErrorCode> InitExternalStoreBackendFromEnvironment();
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchExistsExternalAsync(
+        const std::vector<ObjectKey>& keys);
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1188,6 +1244,7 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    std::shared_ptr<ExternalStoreBackend> external_store_backend_;
 
     // Probe used by healDanglingLocalDiskReplica to prove a completed
     // LOCAL_DISK replica's backing file is gone. Installed by the owner of

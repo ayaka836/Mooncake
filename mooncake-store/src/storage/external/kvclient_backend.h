@@ -38,7 +38,6 @@ class KvClientBackend final : public ExternalStoreBackend {
    private:
     tl::expected<const kv::RegisteredMemory*, ErrorCode> FindRegisteredMemory(
         const Slice& slice) const;
-    tl::expected<kv::CacheKey, ErrorCode> EncodeKey(const ObjectKey& key);
     kv::TaskResult WaitForCompletion(kv::TaskId task);
     tl::expected<TaskHandle, ErrorCode> SubmitLoads(
         const std::vector<ObjectKey>& keys,
@@ -47,7 +46,7 @@ class KvClientBackend final : public ExternalStoreBackend {
     using Completion =
         std::function<std::vector<tl::expected<void, ErrorCode>>(TaskOutput&)>;
     std::unique_ptr<kv::KvClient> kv_client_;
-    TenantId tenant_id_;
+    kv::IoOptions io_options_;
     std::shared_mutex memory_mutex_;
     std::map<uintptr_t, kv::RegisteredMemory> regions_;
 };
