@@ -15,6 +15,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "common/client_buffer_allocation.h"
@@ -1237,10 +1239,11 @@ class RealClient : public PyClient {
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     // KV transfer sessions (process-local; not shared with DummyClient).
-    // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
-    // supported replica + lease); ranges only compare lease locally (no
-    // Master). MEMORY uses BatchTransferReadRanges; DFS reads through
-    // request-scoped staging; LOCAL_DISK restores on the owner then
+    // Native get sessions store a FilterQueryResult'd QueryResult (single
+    // complete supported replica + lease); ranges compare lease locally (no
+    // Master). External reads retain a source marker without a Master replica
+    // lease. MEMORY uses BatchTransferReadRanges; DFS reads
+    // through request-scoped staging; LOCAL_DISK restores on the owner then
     // BatchTransferReadOffloadRanges; DISK BatchGets into a temp buffer then
     // scatters by src_offset.
     // Put sessions track writable + inflight so end/revoke can seal the
@@ -1252,9 +1255,11 @@ class RealClient : public PyClient {
         bool writable{true};
         size_t inflight_transfers{0};
     };
+    struct ExternalReadSource {};
+    using GetSession = std::variant<QueryResult, ExternalReadSource>;
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
-    std::unordered_map<std::string, QueryResult> get_sessions_;
+    std::unordered_map<std::string, GetSession> get_sessions_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
 
     void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
@@ -1353,6 +1358,27 @@ class RealClient : public PyClient {
 
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 
+    // Per-call external sub-batch, retaining the caller's result indices.
+    struct ExternalReadRequests {
+        std::vector<ObjectKey> keys;
+        std::vector<std::vector<Slice>> targets;
+        // Populated only for range reads; offsets are relative to each object.
+        std::vector<std::vector<size_t>> source_offsets;
+        std::vector<size_t> result_indices;
+    };
+
+    std::vector<std::pair<size_t, tl::expected<bool, ErrorCode>>>
+    check_external_get_candidates(
+        const std::vector<ObjectKey> &keys,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results);
+    // The caller has checked that buffers, sizes and source_offsets match.
+    static tl::expected<void, ErrorCode>
+    prepare_external_session_range_read_request(
+        const ObjectKey &key, const std::vector<void *> &buffers,
+        const std::vector<size_t> &sizes,
+        const std::vector<size_t> &source_offsets, size_t result_index,
+        ExternalReadRequests &requests);
+
     struct SessionRangeReadRequest {
         std::string object_key;
         size_t result_index;
@@ -1393,7 +1419,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::vector<size_t>> &all_src_offsets,
-        std::vector<int> &results);
+        std::vector<int> &results, ExternalReadRequests &external_requests);
 
     SessionRangeReadPlan classify_session_range_read_requests(
         std::vector<SessionRangeReadRequest> requests,
