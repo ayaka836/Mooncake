@@ -49,6 +49,37 @@ class ExternalStoreBackend {
     virtual tl::expected<void, ErrorCode> Shutdown() = 0;
 
     /**
+     * @brief Submits complete-object writes in slice order.
+     * @param keys Object keys to write.
+     * @param batched_slices Source slices per key, in object-byte order.
+     * Source memory stays valid and unchanged until Wait returns.
+     * @return Accepted task handle or a submission ErrorCode.
+     */
+    virtual tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& batched_slices) = 0;
+
+    /**
+     * @brief Submits writes at the specified object-byte offsets.
+     * @param keys Object keys to write.
+     * @param sources Source slices per key; lifetimes follow BatchPutAsync.
+     * @param destination_offsets Object-byte offsets per source slice.
+     * @return Accepted task handle or a submission ErrorCode.
+     */
+    virtual tl::expected<TaskHandle, ErrorCode> BatchPutRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets) = 0;
+
+    /**
+     * @brief Submits object deletion independently of native replica leases.
+     * @param keys Object keys to remove.
+     * @return Accepted task handle or a submission ErrorCode.
+     */
+    virtual tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
+        const std::vector<ObjectKey>& keys) = 0;
+
+    /**
      * @brief Submits object existence queries. Wait reports 0 (missing) or 1
      * (present) per key in exists.
      * @param keys Object keys to query.

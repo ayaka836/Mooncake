@@ -343,6 +343,42 @@ class Client {
         const std::vector<std::vector<size_t>>& source_offsets);
 
     /**
+     * @brief Submits batch writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys, in object byte order.
+     * Source buffers must remain valid and unchanged until the task completes.
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources);
+
+    /**
+     * @brief Submits batch range writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys. Source buffers must
+     * remain valid and unchanged until the task completes.
+     * @param destination_offsets Byte offsets relative to each logical key,
+     * indexed to match sources
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets);
+
+    /**
+     * @brief Submits external deletes independently of native replica leases
+     * @param keys Object keys to remove
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchRemoveExternalAsync(
+        const std::vector<ObjectKey>& keys);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store

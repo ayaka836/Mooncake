@@ -106,4 +106,36 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchExistsExternal(
     return results;
 }
 
+tl::expected<ExternalStoreTaskGuard, ErrorCode> Client::BatchPutExternalAsync(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& sources) {
+    if (keys.empty() || !external_store_backend_)
+        return ExternalStoreTaskGuard{};
+    auto submitted = external_store_backend_->BatchPutAsync(keys, sources);
+    if (!submitted) return tl::unexpected(submitted.error());
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
+}
+
+tl::expected<ExternalStoreTaskGuard, ErrorCode>
+Client::BatchPutExternalRangesAsync(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& sources,
+    const std::vector<std::vector<size_t>>& destination_offsets) {
+    if (keys.empty() || !external_store_backend_)
+        return ExternalStoreTaskGuard{};
+    auto submitted = external_store_backend_->BatchPutRangesAsync(
+        keys, sources, destination_offsets);
+    if (!submitted) return tl::unexpected(submitted.error());
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
+}
+
+tl::expected<ExternalStoreTaskGuard, ErrorCode>
+Client::BatchRemoveExternalAsync(const std::vector<ObjectKey>& keys) {
+    if (keys.empty() || !external_store_backend_)
+        return ExternalStoreTaskGuard{};
+    auto submitted = external_store_backend_->BatchRemoveAsync(keys);
+    if (!submitted) return tl::unexpected(submitted.error());
+    return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
+}
+
 }  // namespace mooncake

@@ -70,6 +70,15 @@ std::optional<size_t> GetTransportRegistrationLimit(
 
 namespace {
 
+tl::expected<void, ErrorCode> CompleteExternalPut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    tl::expected<void, ErrorCode> native_result = {});
+void CompleteExternalPut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    std::span<tl::expected<void, ErrorCode>> native_results);
+void CompleteExternalRemove(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
+
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
@@ -2109,6 +2118,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     // Start put operation
+    auto external = BatchPutExternalAsync({key}, {slices});
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result &&
         start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS &&
@@ -2119,7 +2129,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
-            return {};
+            return CompleteExternalPut(external);
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
@@ -2128,7 +2138,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
         }
-        return tl::unexpected(err);
+        return CompleteExternalPut(external, tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2218,7 +2228,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
-            return tl::unexpected(err);
+            return CompleteExternalPut(external, tl::unexpected(err));
         }
     }
 
@@ -2227,18 +2237,49 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
-            return tl::unexpected(revoke_result.error());
+            return CompleteExternalPut(external,
+                                       tl::unexpected(revoke_result.error()));
         }
     }
 
     if (!finalize_decision.success) {
-        return tl::unexpected(finalize_decision.error);
+        return CompleteExternalPut(external,
+                                   tl::unexpected(finalize_decision.error));
     }
 
-    return {};
+    return CompleteExternalPut(external);
 }
 
 namespace {
+
+tl::expected<void, ErrorCode> CompleteExternalPut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    tl::expected<void, ErrorCode> native_result) {
+    CompleteExternalPut(submission, std::span(&native_result, 1));
+    return native_result;
+}
+
+// A key succeeds if either storage path succeeds; always wait for submitted
+// work.
+void CompleteExternalPut(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+    std::span<tl::expected<void, ErrorCode>> native_results) {
+    if (!submission) {
+        LOG(WARNING) << "External put submission failed: "
+                     << submission.error();
+        return;
+    }
+    ExternalStoreBackend::TaskOutput output;
+    auto statuses = submission->Wait(output);
+    for (size_t i = 0; i < statuses.size(); ++i) {
+        if (!statuses[i]) {
+            LOG(WARNING) << "External store operation failed at index=" << i
+                         << ": " << statuses[i].error();
+        } else {
+            native_results[i] = {};
+        }
+    }
+}
 
 // Every COMPLETE replica in the list is a LOCAL_DISK replica owned by this
 // client, so nothing else can serve reads for the key.
@@ -3707,6 +3748,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(*err));
         }
     }
+    auto external = BatchPutExternalAsync(keys, batched_slices);
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
@@ -3723,7 +3765,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    auto native_results = CollectResults(ops);
+    CompleteExternalPut(external, std::span(native_results));
+    return native_results;
 }
 
 // Defined after PutOperation: std::vector<PutOperation> must be instantiated
@@ -3835,7 +3879,9 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
+    auto external = BatchRemoveExternalAsync({key});
     auto result = master_client_.Remove(key, force);
+    CompleteExternalRemove(external);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
@@ -3894,7 +3940,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
         hot_cache_->BumpKeyGenerations(keys);
     }
 
+    auto external = BatchRemoveExternalAsync(keys);
     auto results = master_client_.BatchRemove(keys, force);
+    CompleteExternalRemove(external);
 
     const size_t result_count = std::min(keys.size(), results.size());
     std::vector<std::string> removed_keys;
@@ -3928,6 +3976,28 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
 
     return results;
 }
+
+namespace {
+
+// Drain external deletes for diagnostics; callers return the native result.
+void CompleteExternalRemove(
+    tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission) {
+    if (!submission) {
+        LOG(WARNING) << "External delete submission failed: "
+                     << submission.error();
+        return;
+    }
+    ExternalStoreBackend::TaskOutput output;
+    auto statuses = submission->Wait(output);
+    for (size_t i = 0; i < statuses.size(); ++i) {
+        if (!statuses[i]) {
+            LOG(WARNING) << "External delete failed at index=" << i << ": "
+                         << statuses[i].error();
+        }
+    }
+}
+
+}  // namespace
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     const std::string& key, ReplicaType replica_type) {

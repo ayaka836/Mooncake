@@ -1253,6 +1253,9 @@ class RealClient : public PyClient {
         uint64_t object_size{0};
         ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
         bool writable{true};
+        bool external_only{false};
+        std::optional<ErrorCode> native_error{};
+        std::optional<ErrorCode> external_error{};
         size_t inflight_transfers{0};
     };
     struct ExternalReadSource {};
@@ -1264,6 +1267,17 @@ class RealClient : public PyClient {
 
     void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
                                const std::vector<std::string> &keys);
+    void close_external_only_put_sessions(
+        std::unique_lock<std::mutex> &lock,
+        const std::vector<std::string> &keys,
+        std::vector<tl::expected<void, ErrorCode>> &results, bool is_end);
+    void collect_failed_native_puts(
+        std::vector<std::string> &end_keys, std::vector<size_t> &end_indices,
+        std::vector<char> &has_nof, std::vector<std::string> &failed_keys,
+        std::vector<size_t> &failed_indices,
+        std::vector<tl::expected<void, ErrorCode>> &results);
+    std::vector<tl::expected<void, ErrorCode>> revoke_put_replicas(
+        const std::vector<std::string> &revoke_keys);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -1359,13 +1373,22 @@ class RealClient : public PyClient {
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 
     // Per-call external sub-batch, retaining the caller's result indices.
-    struct ExternalReadRequests {
+    struct ExternalTransferRequests {
         std::vector<ObjectKey> keys;
-        std::vector<std::vector<Slice>> targets;
-        // Populated only for range reads; offsets are relative to each object.
-        std::vector<std::vector<size_t>> source_offsets;
+        std::vector<std::vector<Slice>> slices;
+        // Populated only for ranged transfers; offsets are relative to each
+        // object.
+        std::vector<std::vector<size_t>> offsets;
         std::vector<size_t> result_indices;
     };
+
+    void complete_session_range_put(
+        const std::vector<std::string> &keys,
+        const std::vector<size_t> &idx_map,
+        const std::vector<size_t> &active_indices,
+        const ExternalTransferRequests &external_requests,
+        tl::expected<ExternalStoreTaskGuard, ErrorCode> &external,
+        std::vector<tl::expected<int64_t, ErrorCode>> &results);
 
     std::vector<std::pair<size_t, tl::expected<bool, ErrorCode>>>
     check_external_get_candidates(
@@ -1377,7 +1400,7 @@ class RealClient : public PyClient {
         const ObjectKey &key, const std::vector<void *> &buffers,
         const std::vector<size_t> &sizes,
         const std::vector<size_t> &source_offsets, size_t result_index,
-        ExternalReadRequests &requests);
+        ExternalTransferRequests &requests);
 
     struct SessionRangeReadRequest {
         std::string object_key;
@@ -1419,7 +1442,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::vector<size_t>> &all_src_offsets,
-        std::vector<int> &results, ExternalReadRequests &external_requests);
+        std::vector<int> &results, ExternalTransferRequests &external_requests);
 
     SessionRangeReadPlan classify_session_range_read_requests(
         std::vector<SessionRangeReadRequest> requests,
