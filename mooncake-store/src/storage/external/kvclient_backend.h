@@ -21,11 +21,11 @@ class KvClientBackend final : public ExternalStoreBackend {
     tl::expected<void, ErrorCode> Shutdown() override;
     tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
         const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices) override;
+        const std::vector<std::vector<Slice>>& sources) override;
     tl::expected<TaskHandle, ErrorCode> BatchPutRangesAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources,
-        const std::vector<std::vector<size_t>>& destination_offsets) override;
+        const std::vector<std::vector<size_t>>& target_offsets) override;
     tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
         const std::vector<ObjectKey>& keys) override;
 
@@ -50,17 +50,17 @@ class KvClientBackend final : public ExternalStoreBackend {
         const Slice& slice) const;
     // Append one descriptor per slice in input order.
     tl::expected<void, ErrorCode> AppendStoreEntries(
-        const kv::CacheKey& key, const std::vector<Slice>& slices,
+        const kv::CacheKey& key, const std::vector<Slice>& sources,
         std::vector<kv::KVBuffer>& entries,
-        const std::vector<size_t>* destination_offsets = nullptr);
+        const std::vector<size_t>* target_offsets = nullptr);
 
     // Build descriptors and map each entry back to its input key index.
     std::vector<kv::KVBuffer> BuildStoreEntries(
         const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices,
+        const std::vector<std::vector<Slice>>& sources,
         std::vector<size_t>& indices,
         std::vector<tl::expected<void, ErrorCode>>& results,
-        const std::vector<std::vector<size_t>>* destination_offsets = nullptr);
+        const std::vector<std::vector<size_t>>* target_offsets = nullptr);
 
     // Reduce SDK entry results to one completion status per input key.
     std::vector<tl::expected<void, ErrorCode>> WaitForKeyResults(

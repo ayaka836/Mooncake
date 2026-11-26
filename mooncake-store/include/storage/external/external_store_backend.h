@@ -51,25 +51,25 @@ class ExternalStoreBackend {
     /**
      * @brief Submits complete-object writes in slice order.
      * @param keys Object keys to write.
-     * @param batched_slices Source slices per key, in object-byte order.
+     * @param sources Source slices per key, in object-byte order.
      * Source memory stays valid and unchanged until Wait returns.
      * @return Accepted task handle or a submission ErrorCode.
      */
     virtual tl::expected<TaskHandle, ErrorCode> BatchPutAsync(
         const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices) = 0;
+        const std::vector<std::vector<Slice>>& sources) = 0;
 
     /**
      * @brief Submits writes at the specified object-byte offsets.
      * @param keys Object keys to write.
      * @param sources Source slices per key; lifetimes follow BatchPutAsync.
-     * @param destination_offsets Object-byte offsets per source slice.
+     * @param target_offsets Object-byte offsets per source slice.
      * @return Accepted task handle or a submission ErrorCode.
      */
     virtual tl::expected<TaskHandle, ErrorCode> BatchPutRangesAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources,
-        const std::vector<std::vector<size_t>>& destination_offsets) = 0;
+        const std::vector<std::vector<size_t>>& target_offsets) = 0;
 
     /**
      * @brief Submits object deletion independently of native replica leases.

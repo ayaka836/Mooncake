@@ -359,7 +359,7 @@ class Client {
      * @param keys Object keys
      * @param sources Data slices indexed to match keys. Source buffers must
      * remain valid and unchanged until the task completes.
-     * @param destination_offsets Byte offsets relative to each logical key,
+     * @param target_offsets Byte offsets relative to each logical key,
      * indexed to match sources
      * @return Task guard on submission success, or ErrorCode on failure.
      * Returns an empty guard if keys is empty or no backend is configured.
@@ -367,7 +367,7 @@ class Client {
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalRangesAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources,
-        const std::vector<std::vector<size_t>>& destination_offsets);
+        const std::vector<std::vector<size_t>>& target_offsets);
 
     /**
      * @brief Submits external deletes independently of native replica leases

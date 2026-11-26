@@ -1267,18 +1267,6 @@ class RealClient : public PyClient {
 
     void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
                                const std::vector<std::string> &keys);
-    void close_external_only_put_sessions(
-        std::unique_lock<std::mutex> &lock,
-        const std::vector<std::string> &keys,
-        std::vector<tl::expected<void, ErrorCode>> &results, bool is_end);
-    void collect_failed_native_puts(
-        std::vector<std::string> &end_keys, std::vector<size_t> &end_indices,
-        std::vector<char> &has_nof, std::vector<std::string> &failed_keys,
-        std::vector<size_t> &failed_indices,
-        std::vector<tl::expected<void, ErrorCode>> &results);
-    std::vector<tl::expected<void, ErrorCode>> revoke_put_replicas(
-        const std::vector<std::string> &revoke_keys);
-
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
                                 size_t offset, size_t size,
@@ -1381,6 +1369,18 @@ class RealClient : public PyClient {
         std::vector<std::vector<size_t>> offsets;
         std::vector<size_t> result_indices;
     };
+
+    void close_external_only_put_sessions(
+        std::unique_lock<std::mutex> &lock,
+        const std::vector<std::string> &keys,
+        std::vector<tl::expected<void, ErrorCode>> &results, bool is_end);
+    void collect_failed_native_puts(
+        std::vector<std::string> &end_keys, std::vector<size_t> &end_indices,
+        std::vector<char> &has_nof, std::vector<std::string> &failed_keys,
+        std::vector<size_t> &failed_indices,
+        std::vector<tl::expected<void, ErrorCode>> &results);
+    std::vector<tl::expected<void, ErrorCode>> revoke_put_replicas(
+        const std::vector<std::string> &revoke_keys);
 
     void complete_session_range_put(
         const std::vector<std::string> &keys,

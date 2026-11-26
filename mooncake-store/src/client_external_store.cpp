@@ -120,11 +120,11 @@ tl::expected<ExternalStoreTaskGuard, ErrorCode>
 Client::BatchPutExternalRangesAsync(
     const std::vector<ObjectKey>& keys,
     const std::vector<std::vector<Slice>>& sources,
-    const std::vector<std::vector<size_t>>& destination_offsets) {
+    const std::vector<std::vector<size_t>>& target_offsets) {
     if (keys.empty() || !external_store_backend_)
         return ExternalStoreTaskGuard{};
     auto submitted = external_store_backend_->BatchPutRangesAsync(
-        keys, sources, destination_offsets);
+        keys, sources, target_offsets);
     if (!submitted) return tl::unexpected(submitted.error());
     return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
 }
