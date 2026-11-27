@@ -376,10 +376,6 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
     const kv::CacheKey& key, const std::vector<Slice>& sources,
     std::vector<kv::KVBuffer>& entries,
     const std::vector<size_t>* target_offsets) {
-    if (sources.empty()) {
-        LOG(WARNING) << "Missing KVClient store sources";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
     if (target_offsets && target_offsets->size() != sources.size()) {
         LOG(WARNING) << "KVClient store range count mismatch, sources="
                      << sources.size()
@@ -387,9 +383,11 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     // Preserve slice order even when the source addresses are noncontiguous.
+    const auto begin = entries.size();
     uint64_t logical_offset = 0;
     for (size_t i = 0; i < sources.size(); ++i) {
         const auto& slice = sources[i];
+        if (slice.size == 0) continue;
         if (target_offsets) logical_offset = (*target_offsets)[i];
         // Check before converting offsets and lengths to SDK descriptors.
         if (logical_offset > std::numeric_limits<uint32_t>::max() ||
@@ -422,6 +420,10 @@ tl::expected<void, ErrorCode> KvClientBackend::AppendStoreEntries(
         entry.offset = static_cast<uint32_t>(logical_offset);
         entries.push_back(entry);
         logical_offset += slice.size;
+    }
+    if (entries.size() == begin) {
+        LOG(WARNING) << "Missing KVClient store payload";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
 }
