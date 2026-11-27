@@ -309,12 +309,18 @@ class Client {
      */
     bool ShouldGetFromExternalStore(ErrorCode query_error) const;
 
+    struct ExternalObjectInfo {
+        bool exists{false};
+        std::optional<size_t> size;
+    };
+
     /**
-     * @brief Queries external object existence synchronously. No Master RPC.
+     * @brief Queries the external store synchronously. No Master RPC.
      * @param keys Object keys to query.
-     * @return One existence result or ErrorCode per key, in input order.
+     * @return Existence and optional logical byte size, or an ErrorCode,
+     * for each key in input order.
      */
-    std::vector<tl::expected<bool, ErrorCode>> BatchExistsExternal(
+    std::vector<tl::expected<ExternalObjectInfo, ErrorCode>> BatchQueryExternal(
         const std::vector<ObjectKey>& keys);
 
     /**

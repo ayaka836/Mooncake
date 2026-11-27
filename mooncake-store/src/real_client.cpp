@@ -4058,12 +4058,42 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    auto allocate_buffer = [&](size_t size) -> std::shared_ptr<BufferHandle> {
+        auto alloc_result = client_buffer_allocator->allocate(size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: "
+                       << key;
+            return nullptr;
+        }
+        return std::make_shared<BufferHandle>(std::move(*alloc_result));
+    };
+
     // Query the object info
     auto query_result = client_->Query(key);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            return nullptr;
+            if (!client_->HasExternalStoreBackend()) return nullptr;
+            auto info = client_->BatchQueryExternal({key}).front();
+            if (!info || !info->exists) return nullptr;
+            if (!info->size) {
+                LOG(ERROR)
+                    << "External store did not report an object size for key: "
+                    << key;
+                return nullptr;
+            }
+            const size_t size = *info->size;
+            auto buffer_handle = allocate_buffer(size);
+            if (!buffer_handle) return nullptr;
+            const Slice target{buffer_handle->ptr(), size};
+            auto submitted = client_->BatchGetExternalAsync({key}, {{target}});
+            if (!submitted) return nullptr;
+            ExternalStoreBackend::TaskOutput output;
+            auto statuses = submitted->Wait(output);
+            if (!statuses.front() || output.actual_sizes.front() != size) {
+                return nullptr;
+            }
+            return buffer_handle;
         }
         LOG(ERROR) << "Query failed for key: " << key
                    << " with error: " << toString(query_result.error());
@@ -4099,14 +4129,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     // Allocate buffer
-    auto alloc_result = client_buffer_allocator->allocate(total_length);
-    if (!alloc_result) {
-        LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
-        return nullptr;
-    }
-
-    auto buffer_handle =
-        std::make_shared<BufferHandle>(std::move(*alloc_result));
+    auto buffer_handle = allocate_buffer(total_length);
+    if (!buffer_handle) return nullptr;
 
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
@@ -7271,9 +7295,9 @@ RealClient::check_external_get_candidates(
     }
     if (external_keys.empty()) return {};
 
-    auto exists = client_->BatchExistsExternal(external_keys);
+    auto infos = client_->BatchQueryExternal(external_keys);
     for (size_t i = 0; i < external_keys.size(); ++i) {
-        results[i].second = std::move(exists[i]);
+        results[i].second = infos[i].map(&Client::ExternalObjectInfo::exists);
     }
     return results;
 }

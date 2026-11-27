@@ -210,6 +210,10 @@ KvClientBackend::BatchExistsAsync(const std::vector<ObjectKey>& keys) {
             const bool has_entries =
                 completed.status.ok() ||
                 completed.status.code == kv::StatusCode::PARTIAL_FAILED;
+            if (has_entries && completed.queryResult) {
+                output.object_sizes =
+                    std::move(completed.queryResult->valueSizes);
+            }
             for (size_t i = 0; i < count; ++i) {
                 const auto& status =
                     has_entries ? completed.entryStatus[i] : completed.status;

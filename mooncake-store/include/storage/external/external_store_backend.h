@@ -27,6 +27,8 @@ class ExternalStoreBackend {
         // Values are in input key order and valid only for successful items.
         std::vector<uint8_t> exists;
         std::vector<size_t> actual_sizes;
+        // Query metadata for present keys. Empty or zero means size unavailable.
+        std::vector<size_t> object_sizes;
     };
 
     virtual ~ExternalStoreBackend() = default;

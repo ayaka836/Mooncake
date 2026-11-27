@@ -85,22 +85,28 @@ Client::BatchExistsExternalAsync(const std::vector<ObjectKey>& keys) {
     return ExternalStoreTaskGuard(external_store_backend_.get(), *submitted);
 }
 
-std::vector<tl::expected<bool, ErrorCode>> Client::BatchExistsExternal(
-    const std::vector<ObjectKey>& keys) {
+std::vector<tl::expected<Client::ExternalObjectInfo, ErrorCode>>
+Client::BatchQueryExternal(const std::vector<ObjectKey>& keys) {
     if (keys.empty()) return {};
     auto submitted = BatchExistsExternalAsync(keys);
     if (!submitted) {
-        return std::vector<tl::expected<bool, ErrorCode>>(
+        return std::vector<tl::expected<ExternalObjectInfo, ErrorCode>>(
             keys.size(), tl::unexpected(submitted.error()));
     }
     ExternalStoreBackend::TaskOutput output;
     auto statuses = submitted->Wait(output);
-    std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
+    std::vector<tl::expected<ExternalObjectInfo, ErrorCode>> results(
+        keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (statuses[i]) {
-            results[i] = output.exists[i] != 0;
-        } else {
+        if (!statuses[i]) {
             results[i] = tl::unexpected(statuses[i].error());
+            continue;
+        }
+        auto& info = *results[i];
+        info.exists = output.exists[i] != 0;
+        if (info.exists && i < output.object_sizes.size() &&
+            output.object_sizes[i] != 0) {
+            info.size = output.object_sizes[i];
         }
     }
     return results;
